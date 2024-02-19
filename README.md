@@ -1,3 +1,7 @@
+# Implementing LTCs in PyTorch to test on driving dataset from Comma.ai
+
+Transfering logic from TensorFlow to Pytorch for ltcmodel.
+
 # Liquid time-constant Networks (LTCs)
 
 [Update] A Pytorch version together with tutorials are added to our sister repository: 
