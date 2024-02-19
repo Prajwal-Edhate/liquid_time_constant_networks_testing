@@ -1,4 +1,4 @@
-# Implementing LTCs in PyTorch to test on driving dataset from Comma.ai
+# Implementing LTCs in PyTorch to test on CARL DATASET of driving vehicles
 
 Transfering logic from TensorFlow to Pytorch for ltcmodel.
 
