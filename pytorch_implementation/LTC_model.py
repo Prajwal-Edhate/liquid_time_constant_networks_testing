@@ -19,14 +19,25 @@ class LTCCell(nn.Module):
 
     # Input size minus one means inputs.shape[-1]
 
-    def __init__(self, num_units, _input_shape_one_minus, num_unfolds = 6):
+    def __init__(self, num_units, _input_shape_one_minus, num_unfolds = 6, _solver = 'SemiImplicit', _input_mapping = 'Affine'):
         super(LTCCell, self).__init__()
         
         self._num_units = num_units
         self._is_built = False
         self._ode_solver_unfolds = num_unfolds
-        self._solver = ODESolver.SemiImplicit
-        self._input_mapping = MappingType.Affine
+        if _solver == 'SemiImplicit':
+            self._solver = ODESolver.SemiImplicit
+        elif _solver == 'Explicit':
+            self._solver = ODESolver.Explicit
+        else:
+            self._solver = ODESolver.RungeKutta
+
+        if _input_mapping == 'Affine':
+            self._input_mapping = MappingType.Affine
+        elif _input_mapping == 'Linear':
+            self._input_mapping = MappingType.Linear
+        else:
+            self._input_mapping = MappingType.Identity
         self._erev_init_factor = 1
         self._w_init_max = 1.0
         self._w_init_min = 0.01
