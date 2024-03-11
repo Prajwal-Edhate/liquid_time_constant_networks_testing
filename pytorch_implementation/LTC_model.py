@@ -178,7 +178,7 @@ class LTCCell(nn.Module):
             output_states.append(next_state)
 
         next_state = torch.stack(output_states)
-        return next_state
+        return next_state.view(batch_size,-1)
 
     def _map_inputs(self, inputs):
         if self._input_mapping == MappingType.Affine or self._input_mapping == MappingType.Linear:
