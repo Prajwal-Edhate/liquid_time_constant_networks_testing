@@ -11,6 +11,8 @@ import h5py as h5
 from PIL import Image
 import torchvision.transforms as transforms
 from heatmap import GradCAMSequence
+import cv2
+import torch.nn.functional as F
 
 
 class DrivingImageDataset(Dataset):
@@ -34,6 +36,7 @@ class DrivingImageDataset(Dataset):
         self.start_point = start_point
         # List for angles and images
         self.steering_angles = []
+        self.speeds = []
         self.images = []
 
         # Open each h5py file and extract data. Discard initial stationary data
@@ -41,9 +44,12 @@ class DrivingImageDataset(Dataset):
             with h5.File(os.path.join(self.file_path,'log',self.h5py_file_names[i]), "r") as file:
                 if num_data is not None:
                     steering_angles = file['steering_angle'][self.start_point:self.start_point+num_data]
+                    speeds = file['speed'][self.start_point:self.start_point+num_data]
                 else:
                     steering_angles = file['steering_angle'][self.start_point*5:][::5]
+                    speeds = file['speed'][self.start_point*5:][::5]
                 self.steering_angles.append(steering_angles)
+                self.speeds.append(speeds)
             
             with h5.File(os.path.join(self.file_path,'camera',self.h5py_file_names[i]), "r") as file:
                 if num_data is not None:
@@ -53,23 +59,30 @@ class DrivingImageDataset(Dataset):
                 self.images.append(images)
         
         self.images = [image for image_list in self.images for image in image_list]
-        print("Total Images",len(self.images))
         self.steering_angles = torch.as_tensor([angle for angle_list in self.steering_angles for angle in angle_list])
-        print("shape of Steering angles",self.steering_angles.shape)
+        self.speeds = torch.as_tensor([speed for speed_list in self.speeds for speed in speed_list])
+        # Mean and Std for speed and steering angles
         self.steering_angle_mean = torch.mean(self.steering_angles)
         self.steering_angle_std = torch.std(self.steering_angles)
+        self.speed_mean = torch.mean(self.speeds)
+        self.speed_std = torch.std(self.speeds)
 
     def __len__(self):
         return min(len(self.images), len(self.steering_angles)) - self.sequence_length
 
     def __getitem__(self,index):
         try:
-        # get the next steering angle
+            # get the next steering angle and speed
             if self.steering_angle_std == 0:
                 steering_angle = self.steering_angles[index + self.sequence_length]/self.steering_angles[index + self.sequence_length]
             else:
                 steering_angle = (self.steering_angles[index + self.sequence_length]- self.steering_angle_mean)/self.steering_angle_std
             
+            if self.speed_std == 0:
+                speed = self.speeds[index + self.sequence_length]/self.speeds[index + self.sequence_length]
+            else:
+                speed = (self.speeds[index + self.sequence_length]- self.speed_mean)/self.speed_std
+
             # Get Image sequence
             images = []
             for i in range(self.sequence_length):
@@ -80,8 +93,11 @@ class DrivingImageDataset(Dataset):
                 images.append(image)
 
             images = torch.stack(images)
+            steering_angle = steering_angle.type(torch.float32)
+            speed = speed.type(torch.float32)
+            speed_and_angle = torch.tensor([speed,steering_angle])
 
-            return images, steering_angle.type(torch.float32)
+            return images, speed_and_angle
         except IndexError as e:
             print(f"Error in __getitem__ at index {index}: {e}")
 
@@ -113,7 +129,7 @@ class SteeringPrediction(nn.Module):
         self.conv5 = nn.Conv2d(15, 18, kernel_size = 3, padding = 1, stride = 2, bias = False)
         self.bn5 = nn.BatchNorm2d(18, affine = True, track_running_stats = True)
         self.ltc1 = LTCCell(num_units=16, _input_shape_one_minus = sequence_length * 18)
-        self.ltc2 = LTCCell(num_units=1, _input_shape_one_minus = 16)
+        self.ltc2 = LTCCell(num_units=2, _input_shape_one_minus = 16)
         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
         self.state1 = torch.zeros((1,1))
         self.state2 = torch.zeros((1,1))
@@ -122,20 +138,27 @@ class SteeringPrediction(nn.Module):
         #batch_size, sequence_length, channels, height, width = x.size()
         x = x.permute(1,0,2,3,4)
         intermediate_output = []
+        features = []
         for i in range(x.size(0)):
             s = x[i]
             s = self.conv1(s)
             s = self.bn1(s)
             s = self.leakyrelu(s)
+
+            features.append(torch.mean(s, dim = 1, keepdim=True))
+
             s = self.conv2(s)
             s = self.bn2(s)
             s = self.leakyrelu(s)
+
             s = self.conv3(s)
             s = self.bn3(s)
             s = self.leakyrelu(s)
+
             s = self.conv4(s)
             s = self.bn4(s)
             s = self.leakyrelu(s)
+            
             s = self.conv5(s)
             s = self.bn5(s)
             s = self.avgpool(s)
@@ -144,12 +167,14 @@ class SteeringPrediction(nn.Module):
             intermediate_output.append(s)
 
         concatenated_out = torch.cat(intermediate_output, dim = 1)
+        feat = torch.stack(features)
+        feat = feat.permute(1,0,2,3,4)
+        #print(feat.shape)
         #print(concatenated_out.shape)
         out = self.ltc1(concatenated_out, self.state1)
         out = self.ltc2(out,self.state2)
-        out = out.view(-1)
 
-        return out
+        return out, feat
     
     def save_model(self, name):
         torch.save(self.state_dict(), name)
@@ -191,7 +216,7 @@ def train(model, dataset, device, num_epochs, batch_size, optimizer, loss_functi
         for sequence, targets in train_loader:
             sequence, targets = sequence.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs= model(sequence)
+            outputs,_= model(sequence)
             loss = loss_function(outputs, targets)
             loss.backward()
             optimizer.step()
@@ -207,7 +232,7 @@ def train(model, dataset, device, num_epochs, batch_size, optimizer, loss_functi
         with torch.no_grad():
             for sequence, targets in val_loader:
                 sequence, targets = sequence.to(device), targets.to(device)
-                outputs= model(sequence)
+                outputs,_= model(sequence)
                 loss = loss_function(outputs, targets)
                 val_loss += loss.item()
                 # Remove from GPU
@@ -216,7 +241,7 @@ def train(model, dataset, device, num_epochs, batch_size, optimizer, loss_functi
             val_loss /= len(val_loader.dataset)
             if val_loss<min_val:
                 min_val = val_loss
-                model.save_model(os.path.join(checkpoint_save_dir,f"checkpoint_{epoch}_min_val_loss.pkl"))
+                model.save_model(os.path.join(checkpoint_save_dir,f"checkpoint_min_val_loss.pkl"))
         
         print(f"Epoch {epoch}/{num_epochs}: Train_loss {running_loss} Val_loss {val_loss}")
 
@@ -228,7 +253,7 @@ def train(model, dataset, device, num_epochs, batch_size, optimizer, loss_functi
             with torch.no_grad():
                 for sequence, targets in test_loader:
                     sequence, targets = sequence.to(device), targets.to(device)
-                    outputs = model(sequence)
+                    outputs,_ = model(sequence)
                     loss = loss_function(outputs, targets)
                     test_loss += loss.item()
                     # Remove from GPU
@@ -243,8 +268,8 @@ def count_parameters(model):
 
 def main():
     
-    sequence_length = 10
-    start_point = 1900
+    sequence_length = 24
+    start_point = 1000
     checkpoint_path = 'checkpoint/commaai_steering'
     os.makedirs(checkpoint_path, exist_ok=True)
     train_split = 0.8
@@ -272,20 +297,41 @@ def main():
 
     train(model=model, dataset=dataset, device=device, num_epochs=num_epochs,
         batch_size=batch_size, optimizer=optimizer, loss_function=loss_function, train_split=train_split, val_split=val_split,
-        checkpoint_save_dir=checkpoint_path, continue_training= True)
+        checkpoint_save_dir=checkpoint_path, continue_training= False)
+
+def heatmap():
+    # Load Model Weights
+    model = SteeringPrediction(24)
+    weights = torch.load('checkpoint/commaai_steering/checkpoint_1_min_val_loss.pkl')
+    temp_input = torch.randn((weights['ltc1.input_w'].size(0),24,3,160,320))
+    _,_ = model(temp_input)
+    model.load_state_dict(weights)
+    model.eval()
+    # Get Driving dataset for heatmap generation
+    dataset = DrivingImageDataset(sequence_length=24, num_data=200)
+    input = dataset[180][0].unsqueeze(0)
+    _,heatmap = model(input)
+    #print(heatmap.shape)
+    with torch.no_grad():
+        for i in range(heatmap.size(0)):
+            for j in range(heatmap.size(1)):
+                heat_full = F.interpolate(heatmap[i][j].unsqueeze(0), size = (160,320),
+                                          mode = 'bilinear', align_corners = False)
+                heatmap_np = heat_full.squeeze().numpy()
+                # Normalize heat map
+                heatmap_np = (heatmap_np - heatmap_np.min()) / (heatmap_np.max() - heatmap_np.min())
+                heatmap_np = (heatmap_np * 255).astype(np.uint8)
+
+                # Create PIL Image
+                heatmap_color = cv2.applyColorMap((heatmap_np), cv2.COLORMAP_JET)
+                original = transforms.ToPILImage()(input[i][j])
+                #print(type(original))
+                # Save the images
+                sequence_directory = f'heatmap/sequence_{i+1}' if heatmap.size(0) > 0 else 'heatmap/sequence'
+                os.makedirs(sequence_directory, exist_ok=True)
+                cv2.imwrite(f'{sequence_directory}/map_{j}.jpg',heatmap_color)
+                original.save(f'{sequence_directory}/original_{j}.jpg')
 
 if __name__ == '__main__':
     main()
 
-'''model = SteeringPrediction(sequence_length=10)
-input = torch.randn((24,10,3,160,320))
-out = model(input)
-states = model.state_dict()
-
-model_weights = torch.load('checkpoint/commaai_steering/checkpoint_10.pkl')
-
-print(model_weights['ltc1.input_w'].size(0))
-print(states['ltc1.input_w'].shape)
-
-model.load_state_dict(model_weights)
-'''
