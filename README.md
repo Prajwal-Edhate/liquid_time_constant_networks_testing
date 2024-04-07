@@ -1,6 +1,6 @@
 # Implementing LTCs in PyTorch to test on COMMAAI dataset of driving vehicles
 
-Transfering logic from TensorFlow to Pytorch for ltcmodel.
+Translating implementation of LTC RNN cell from Tensorflow to PyTorch. Implementing the Pytorch LTC Cell for steering angle prediction using COMMAAI dataset's camera input.
 
 # Liquid time-constant Networks (LTCs)
 
